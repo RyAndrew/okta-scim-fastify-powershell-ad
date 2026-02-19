@@ -60,7 +60,7 @@ export function scimToAdParams(
   // userName → SamAccountName (and optionally UserPrincipalName)
   const userName = scimUser['userName'] as string | undefined;
   if (userName) {
-    params.SamAccountName = userName;
+    params.SamAccountName = userName.split('@')[0].substring(0, 20);
     if (userName.includes('@')) {
       params.UserPrincipalName = userName;
     }
@@ -91,8 +91,12 @@ export function scimToAdParams(
   const externalId = scimUser['externalId'] as string | undefined;
   if (externalId) params.EmployeeID = externalId;
 
-  // CN for New-ADUser — required; prefer displayName then userName
-  params.Name = params.DisplayName ?? params.SamAccountName;
+  // CN for New-ADUser — first + last, falling back to displayName then SamAccountName
+  const fullName =
+    name?.givenName && name?.familyName
+      ? `${name.givenName} ${name.familyName}`
+      : undefined;
+  params.Name = fullName ?? params.DisplayName ?? params.SamAccountName;
 
   // Target OU (New-ADUser only)
   if (baseOu) params.Path = baseOu;

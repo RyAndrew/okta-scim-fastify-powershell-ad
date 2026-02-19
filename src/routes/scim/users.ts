@@ -182,7 +182,7 @@ export async function scimUsersRoutes(server: FastifyInstance): Promise<void> {
 
     // Idempotency: reject if a user with the same userName already exists
     const duplicate = await db<ScimUserRow>('scim_users')
-      .where({ sam_account_name: scimUser.userName })
+      .where({ sam_account_name: scimUser.userName.split('@')[0].substring(0, 20) })
       .first();
 
     if (duplicate) {
@@ -199,19 +199,7 @@ export async function scimUsersRoutes(server: FastifyInstance): Promise<void> {
 
     // Use externalId (Okta user ID) as our SCIM id for easy correlation
     const userId = scimUser.externalId ?? uuidv4();
-    const ts = now();
     const scimResource = { ...scimUser, id: userId };
-
-    // Insert a pending row before touching AD so we have an audit trail
-    // even if the PS command fails
-    await db('scim_users').insert({
-      id: userId,
-      sam_account_name: scimUser.userName,
-      scim_resource: JSON.stringify(scimResource),
-      sync_status: 'pending',
-      created_at: ts,
-      updated_at: ts,
-    });
 
     // ── Execute New-ADUser ────────────────────────────────────────────────
     const adParams = scimToAdParams(
@@ -226,22 +214,21 @@ export async function scimUsersRoutes(server: FastifyInstance): Promise<void> {
 
     if (psResult.exitCode !== 0) {
       const { status, scimType, detail } = mapPsErrorToScim(psResult.stderr);
-      await db('scim_users').where({ id: userId }).update({
-        sync_status: 'error',
-        last_error: psResult.stderr.substring(0, 2000),
-        updated_at: now(),
-      });
       return reply.status(status).send(formatError(status, detail, scimType));
     }
 
     // ── Persist objectGUID ────────────────────────────────────────────────
     const objectGuid = extractObjectGuid(psResult.parsed);
+    const ts = now();
 
-    await db('scim_users').where({ id: userId }).update({
+    await db('scim_users').insert({
+      id: userId,
+      sam_account_name: scimUser.userName.split('@')[0].substring(0, 20),
+      scim_resource: JSON.stringify(scimResource),
       ad_object_guid: objectGuid ?? null,
       sync_status: 'synced',
-      last_error: null,
-      updated_at: now(),
+      created_at: ts,
+      updated_at: ts,
     });
 
     // ── Refresh ad_resource from AD ───────────────────────────────────────
@@ -279,7 +266,7 @@ export async function scimUsersRoutes(server: FastifyInstance): Promise<void> {
       const scimResource = { ...scimUser, id };
       await db('scim_users').where({ id }).update({
         scim_resource: JSON.stringify(scimResource),
-        sam_account_name: scimUser.userName ?? row.sam_account_name,
+        sam_account_name: scimUser.userName ? scimUser.userName.split('@')[0].substring(0, 20) : row.sam_account_name,
         sync_status: 'pending',
         updated_at: now(),
       });
