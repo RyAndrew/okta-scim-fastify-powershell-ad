@@ -169,9 +169,9 @@ export async function execNewAdUser(
 ): Promise<PowerShellResult> {
   const { AccountPassword, Name, Path, SamAccountName, ...rest } = params;
 
-  // Build the static-param fragments (everything except password)
+  // Build the static-param fragments (everything except password and params
+  // already injected inline: Name, Path, SamAccountName, AccountPassword)
   const adParams: Record<string, unknown> = { ...rest };
-  if (SamAccountName) adParams['SamAccountName'] = SamAccountName;
 
   const fragments = buildParamFragments(adParams);
 
