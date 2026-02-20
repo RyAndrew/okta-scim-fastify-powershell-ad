@@ -4,16 +4,15 @@
 
 import fs from 'fs';
 import Fastify, { FastifyReply, FastifyRequest } from 'fastify';
+import { createAuthPlugin, createScimUsersPlugin } from 'scim-fastify-core';
 import { config } from './config';
-import { initDb } from './db';
-import authPlugin from './plugins/auth';
+import { db, initDb } from './db';
 import { registerRequestLogger } from './middleware/request-logger';
-import { scimUsersRoutes } from './routes/scim/users';
+import { PowerShellAdBackend } from './backend';
 
 // ---------------------------------------------------------------------------
-// SCIM discovery payloads (RFC 7644 §4)
-// These endpoints are intentionally unauthenticated — Okta probes them
-// during provisioning setup before credentials are configured.
+// SCIM discovery (RFC 7644 §4)
+// Intentionally unauthenticated — Okta probes these during setup.
 // ---------------------------------------------------------------------------
 
 const SERVICE_PROVIDER_CONFIG = {
@@ -28,7 +27,8 @@ const SERVICE_PROVIDER_CONFIG = {
     {
       type: 'httpbasic',
       name: 'HTTP Basic',
-      description: 'HTTP Basic authentication — username is ignored, password must equal the configured API_KEY',
+      description:
+        'HTTP Basic authentication — username is ignored, password must equal the configured API_KEY',
     },
   ],
   meta: {
@@ -55,35 +55,26 @@ async function start(): Promise<void> {
       key: fs.readFileSync(config.ssl.keyPath),
       cert: fs.readFileSync(config.ssl.certPath),
     },
-    logger: {
-      level: process.env.LOG_LEVEL ?? 'info',
-    },
+    logger: { level: process.env.LOG_LEVEL ?? 'info' },
   });
 
-  // ── Database ──────────────────────────────────────────────────────────────
   await initDb();
   server.log.info('Database initialised');
 
-  // ── Round-trip request/response logger ───────────────────────────────────
-  registerRequestLogger(server);
+  registerRequestLogger(server, db);
 
-  // ── Plugins ───────────────────────────────────────────────────────────────
-  await server.register(authPlugin);
+  await server.register(createAuthPlugin(config.apiKey));
 
-  // ── SCIM discovery routes (unauthenticated) ───────────────────────────────
-  // RFC 7644 uses the singular form; Okta probes the plural form as well.
   server.get('/scim/v2/ServiceProviderConfig', handleServiceProviderConfig);
   server.get('/scim/v2/ServiceProviderConfigs', handleServiceProviderConfig);
 
-  // ── Authenticated SCIM routes ─────────────────────────────────────────────
-  await server.register(scimUsersRoutes, { prefix: '/scim/v2/Users' });
+  const backend = new PowerShellAdBackend(db, config);
+  await server.register(createScimUsersPlugin(backend), { prefix: '/scim/v2/Users' });
 
-  // Health check — unauthenticated, used by load balancers and monitoring
   server.get('/health', async (_request, reply) => {
     return reply.status(200).send({ status: 'ok', service: 'scim-ad-bridge' });
   });
 
-  // ── Start ─────────────────────────────────────────────────────────────────
   try {
     await server.listen({ port: config.port, host: '0.0.0.0' });
   } catch (err) {

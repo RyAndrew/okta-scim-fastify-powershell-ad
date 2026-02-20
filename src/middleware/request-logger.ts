@@ -5,13 +5,10 @@
 //   onRequest  → INSERT row with method, url, ip (body not yet parsed)
 //   onSend     → UPDATE row with request_body (now parsed) + capture response payload
 //   onResponse → UPDATE row with final status code + duration_ms
-//
-// The response body is captured in onSend via a closure stored in a per-request
-// Map keyed by request.id (a Fastify-assigned string unique per connection).
 // ---------------------------------------------------------------------------
 
 import { FastifyInstance } from 'fastify';
-import { db } from '../db';
+import type { Knex } from 'knex';
 
 interface RequestMeta {
   rowId: number;
@@ -19,11 +16,10 @@ interface RequestMeta {
   responseBody: string | null;
 }
 
-export function registerRequestLogger(server: FastifyInstance): void {
+export function registerRequestLogger(server: FastifyInstance, db: Knex): void {
   const meta = new Map<string, RequestMeta>();
 
   // ── 1. onRequest ─────────────────────────────────────────────────────────
-  // Body is not yet parsed here, so we insert a partial row.
   server.addHook('onRequest', async (request) => {
     const startTime = Date.now();
     const rawUrl = request.url;
@@ -43,12 +39,10 @@ export function registerRequestLogger(server: FastifyInstance): void {
   });
 
   // ── 2. onSend ────────────────────────────────────────────────────────────
-  // Body is parsed, and we have the serialised response payload.
   server.addHook('onSend', async (request, _reply, payload) => {
     const entry = meta.get(request.id);
     if (!entry) return payload;
 
-    // Capture request body (available after content-type parsing)
     let requestBodyStr: string | null = null;
     if (request.body !== undefined && request.body !== null) {
       try {
@@ -61,7 +55,6 @@ export function registerRequestLogger(server: FastifyInstance): void {
       }
     }
 
-    // Capture response payload
     let responseBodyStr: string | null = null;
     if (typeof payload === 'string') {
       responseBodyStr = payload;
@@ -69,10 +62,8 @@ export function registerRequestLogger(server: FastifyInstance): void {
       responseBodyStr = payload.toString('utf8');
     }
 
-    // Store response body for the onResponse hook
     entry.responseBody = responseBodyStr;
 
-    // Update the DB row with the request body (non-blocking)
     if (requestBodyStr) {
       db('incoming_requests')
         .where({ id: entry.rowId })
@@ -86,7 +77,6 @@ export function registerRequestLogger(server: FastifyInstance): void {
   });
 
   // ── 3. onResponse ────────────────────────────────────────────────────────
-  // Final update: status code, response body, and elapsed duration.
   server.addHook('onResponse', async (request, reply) => {
     const entry = meta.get(request.id);
     if (!entry) return;
@@ -106,7 +96,6 @@ export function registerRequestLogger(server: FastifyInstance): void {
         server.log.error({ err: e }, '[request-logger] Failed to update response fields'),
       );
 
-    // Clean up the in-memory map entry
     meta.delete(request.id);
   });
 }
