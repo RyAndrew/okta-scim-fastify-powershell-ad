@@ -69,7 +69,14 @@ async function start(): Promise<void> {
   server.get('/scim/v2/ServiceProviderConfigs', handleServiceProviderConfig);
 
   const backend = new PowerShellAdBackend(config);
-  await server.register(createScimUsersPlugin(backend), { prefix: '/scim/v2/Users' });
+  // createScimUsersPlugin is wrapped in fastify-plugin, which ignores `prefix`
+  // and leaks its auth hook to the parent. An encapsulating wrapper fixes both.
+  await server.register(
+    async (scope) => {
+      await scope.register(createScimUsersPlugin(backend));
+    },
+    { prefix: '/scim/v2/Users' },
+  );
 
   server.get('/health', async (_request, reply) => {
     return reply.status(200).send({ status: 'ok', service: 'scim-ad-bridge' });
