@@ -68,7 +68,7 @@ async function start(): Promise<void> {
   server.get('/scim/v2/ServiceProviderConfig', handleServiceProviderConfig);
   server.get('/scim/v2/ServiceProviderConfigs', handleServiceProviderConfig);
 
-  const backend = new PowerShellAdBackend(db, config);
+  const backend = new PowerShellAdBackend(config);
   await server.register(createScimUsersPlugin(backend), { prefix: '/scim/v2/Users' });
 
   server.get('/health', async (_request, reply) => {

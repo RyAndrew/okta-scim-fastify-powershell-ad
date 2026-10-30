@@ -2,7 +2,8 @@
 // PowerShell execution layer
 //
 // All Active Directory operations run through this module.  Every execution
-// is automatically audited to the powershell_executions table.
+// is printed to the console for debugging and audited to the
+// powershell_executions table.
 //
 // Design decisions:
 //   - execFile("powershell.exe") rather than exec() to avoid shell injection.
@@ -10,16 +11,18 @@
 //     surface as exceptions that map to a non-zero exit code.
 //   - Import-Module ActiveDirectory is explicit so the script works when
 //     the PS session doesn't auto-load the module.
-//   - ConvertTo-Json is applied only for cmdlets that produce output.
-//   - Passwords are never logged.
+//   - Secrets are passed to the child process via environment variables, so
+//     the script text never contains them and is safe to print and log.
 // ---------------------------------------------------------------------------
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { db } from './db';
-import { AdUserParams } from './config/mapping';
+import { AdUser, AdUserParams } from './config/mapping';
 
 const execFileAsync = promisify(execFile);
+
+const CONSOLE_OUTPUT_LIMIT = 4_000;
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -39,10 +42,13 @@ export interface PowerShellResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Execute an arbitrary PowerShell script and log the result.
+ * Execute an arbitrary PowerShell script, print it to the console and log
+ * the result.
  *
- * @param script      The full PS script to run (multi-line OK).
+ * @param script      The full PS script to run (multi-line OK). Must not
+ *                    contain secrets — pass those through `env` instead.
  * @param logMeta     Metadata written to the audit log row.
+ * @param env         Extra environment variables for the child process.
  */
 export async function executePowerShell(
   script: string,
@@ -51,6 +57,7 @@ export async function executePowerShell(
     params: Record<string, unknown>;
     scimUserId?: string;
   },
+  env: Record<string, string> = {},
 ): Promise<PowerShellResult> {
   const startTime = Date.now();
   let stdout = '';
@@ -58,11 +65,18 @@ export async function executePowerShell(
   let exitCode = 0;
   let parsed: unknown = null;
 
+  const label = `[PS] ${logMeta.cmdlet}${logMeta.scimUserId ? ` (user ${logMeta.scimUserId})` : ''}`;
+  console.log(`${label} executing:\n${script}\n`);
+
   try {
     const result = await execFileAsync(
       'powershell.exe',
       ['-NonInteractive', '-NoProfile', '-Command', script],
-      { maxBuffer: 10 * 1024 * 1024, timeout: 30_000 },
+      {
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 30_000,
+        env: { ...process.env, ...env },
+      },
     );
     stdout = result.stdout ?? '';
     stderr = result.stderr ?? '';
@@ -75,6 +89,10 @@ export async function executePowerShell(
   }
 
   const durationMs = Date.now() - startTime;
+
+  console.log(`${label} exit ${exitCode} in ${durationMs}ms`);
+  if (stderr.trim()) console.log(`${label} stderr:\n${truncate(stderr.trim())}`);
+  if (stdout.trim()) console.log(`${label} stdout:\n${truncate(stdout.trim())}`);
 
   if (stdout.trim()) {
     try {
@@ -99,6 +117,12 @@ export async function executePowerShell(
     .catch((e: Error) => console.error('[PS audit] DB write failed:', e.message));
 
   return { stdout, stderr, exitCode, durationMs, parsed };
+}
+
+function truncate(text: string): string {
+  return text.length > CONSOLE_OUTPUT_LIMIT
+    ? `${text.substring(0, CONSOLE_OUTPUT_LIMIT)}... (${text.length - CONSOLE_OUTPUT_LIMIT} more chars)`
+    : text;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,49 +176,140 @@ function buildParamFragments(
 }
 
 // ---------------------------------------------------------------------------
+// Get-ADUser (search)
+// ---------------------------------------------------------------------------
+
+/** How to locate users in AD. Every lookup is scoped to the search base. */
+export type AdUserLookup =
+  | { by: 'all' }
+  | { by: 'guid'; value: string }
+  /** Matches UserPrincipalName or SamAccountName exactly. */
+  | { by: 'userName'; value: string }
+  | { by: 'employeeId'; value: string }
+  | { by: 'email'; value: string };
+
+/** Extra properties beyond Get-ADUser's defaults that AdUser needs. */
+const AD_EXTRA_PROPERTIES = 'DisplayName,EmailAddress,EmployeeID,whenCreated,whenChanged';
+
+/**
+ * Projects ADUser objects onto the flat AdUser shape. GUIDs and dates are
+ * converted to strings explicitly because ConvertTo-Json serialises them
+ * differently across PowerShell versions.
+ */
+const AD_USER_SELECT = [
+  "@{n='ObjectGUID';e={$_.ObjectGUID.ToString()}}",
+  'SamAccountName',
+  'UserPrincipalName',
+  'GivenName',
+  'Surname',
+  'DisplayName',
+  'EmailAddress',
+  'EmployeeID',
+  'Enabled',
+  'DistinguishedName',
+  "@{n='whenCreated';e={$_.whenCreated.ToUniversalTime().ToString('o')}}",
+  "@{n='whenChanged';e={$_.whenChanged.ToUniversalTime().ToString('o')}}",
+].join(', ');
+
+/**
+ * Build the `$value = ...` assignment and -Filter expression for a lookup.
+ * The filter references $value rather than embedding the literal, so the
+ * AD filter parser never sees user-supplied text.
+ */
+function buildLookupFilter(lookup: AdUserLookup): { assignment: string; filter: string } {
+  switch (lookup.by) {
+    case 'all':
+      return { assignment: '', filter: '*' };
+    case 'guid':
+      return { assignment: `$value = [guid]'${esc(lookup.value)}'`, filter: "'ObjectGUID -eq $value'" };
+    case 'userName':
+      return {
+        assignment: `$value = '${esc(lookup.value)}'`,
+        filter: "'UserPrincipalName -eq $value -or SamAccountName -eq $value'",
+      };
+    case 'employeeId':
+      return { assignment: `$value = '${esc(lookup.value)}'`, filter: "'EmployeeID -eq $value'" };
+    case 'email':
+      return { assignment: `$value = '${esc(lookup.value)}'`, filter: "'mail -eq $value'" };
+  }
+}
+
+/**
+ * Search AD for users under `searchBase`.
+ * Check `result.exitCode` for failure; `users` is empty when nothing matches.
+ */
+export async function execFindAdUsers(
+  searchBase: string,
+  lookup: AdUserLookup,
+  scimUserId?: string,
+): Promise<{ users: AdUser[]; result: PowerShellResult }> {
+  const { assignment, filter } = buildLookupFilter(lookup);
+
+  const script = `
+${PS_HEADER}
+${assignment}
+$users = @(Get-ADUser -SearchBase '${esc(searchBase)}' -Filter ${filter} -Properties ${AD_EXTRA_PROPERTIES})
+ConvertTo-Json -Depth 3 -Compress -InputObject @($users | Select-Object ${AD_USER_SELECT})
+`.trim();
+
+  const result = await executePowerShell(script, {
+    cmdlet: 'Get-ADUser',
+    params: { searchBase, ...lookup },
+    scimUserId,
+  });
+
+  if (result.exitCode !== 0) return { users: [], result };
+
+  const parsed = result.parsed;
+  const users = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === 'object'
+      ? [parsed]
+      : [];
+  return { users: users as AdUser[], result };
+}
+
+// ---------------------------------------------------------------------------
 // New-ADUser
 // ---------------------------------------------------------------------------
 
 export interface NewAdUserScriptParams extends AdUserParams {
-  /** Required by AD. Passed as a SecureString. Never logged. */
+  /** Required by AD. Passed via environment variable. Never logged. */
   AccountPassword: string;
 }
 
 /**
- * Create a new AD user and return the created object as parsed JSON.
+ * Create a new AD user. On success `parsed` is the new user's ObjectGUID string.
  */
-export async function execNewAdUser(
-  params: NewAdUserScriptParams,
-  scimUserId: string,
-): Promise<PowerShellResult> {
+export async function execNewAdUser(params: NewAdUserScriptParams): Promise<PowerShellResult> {
   const { AccountPassword, Name, Path, SamAccountName, ...rest } = params;
 
   // Build the static-param fragments (everything except password and params
   // already injected inline: Name, Path, SamAccountName, AccountPassword)
-  const adParams: Record<string, unknown> = { ...rest };
-
-  const fragments = buildParamFragments(adParams);
+  const fragments = buildParamFragments(rest as Record<string, unknown>);
 
   const script = `
 ${PS_HEADER}
-$password = ConvertTo-SecureString -String '${esc(AccountPassword)}' -AsPlainText -Force
-New-ADUser \`
+$password = ConvertTo-SecureString -String $env:SCIM_AD_ACCOUNT_PASSWORD -AsPlainText -Force
+$user = New-ADUser \`
   -Name '${esc(Name ?? SamAccountName ?? '')}' \`
   ${SamAccountName ? `-SamAccountName '${esc(SamAccountName)}' \`` : ''}
   -AccountPassword $password \`
   -ChangePasswordAtLogon:$false \`
   ${Path ? `-Path '${esc(Path)}' \`` : ''}
   ${fragments} \`
-  -PassThru |
-  ConvertTo-Json -Depth 5 -Compress
+  -PassThru
+ConvertTo-Json -Compress -InputObject $user.ObjectGUID.ToString()
 `.trim();
 
-  return executePowerShell(script, {
-    cmdlet: 'New-ADUser',
-    // Exclude the password from the logged params
-    params: sanitizeParams({ Name, Path, SamAccountName, ...rest }),
-    scimUserId,
-  });
+  return executePowerShell(
+    script,
+    {
+      cmdlet: 'New-ADUser',
+      params: { Name, Path, SamAccountName, ...rest },
+    },
+    { SCIM_AD_ACCOUNT_PASSWORD: AccountPassword },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -244,59 +359,6 @@ Remove-ADUser -Identity '${esc(identity)}' -Confirm:$false
     params: { identity },
     scimUserId,
   });
-}
-
-// ---------------------------------------------------------------------------
-// Get-ADUser
-// ---------------------------------------------------------------------------
-
-/**
- * Read a user from AD and return the full attribute set as a parsed object.
- * Returns `null` when the user does not exist or PowerShell fails.
- */
-export async function execGetAdUser(
-  identity: string,
-  scimUserId?: string,
-): Promise<Record<string, unknown> | null> {
-  const script = `
-${PS_HEADER}
-Get-ADUser -Identity '${esc(identity)}' -Properties * |
-  ConvertTo-Json -Depth 5 -Compress
-`.trim();
-
-  const result = await executePowerShell(script, {
-    cmdlet: 'Get-ADUser',
-    params: { identity },
-    scimUserId,
-  });
-
-  if (result.exitCode !== 0 || !result.parsed) return null;
-  return result.parsed as Record<string, unknown>;
-}
-
-// ---------------------------------------------------------------------------
-// ObjectGUID extraction helper
-// ---------------------------------------------------------------------------
-
-/**
- * Extract the objectGUID string from a parsed `Get-ADUser` / `New-ADUser -PassThru` result.
- * PowerShell serialises Guid objects in various ways across PS versions.
- */
-export function extractObjectGuid(parsed: unknown): string | null {
-  if (!parsed || typeof parsed !== 'object') return null;
-  const obj = parsed as Record<string, unknown>;
-
-  // PS 5.1 / 7: "ObjectGUID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-  const raw = obj['ObjectGUID'];
-  if (typeof raw === 'string' && raw.length > 0) return raw;
-
-  // Some versions wrap it: { "value": "..." }
-  if (raw && typeof raw === 'object') {
-    const wrapped = raw as Record<string, unknown>;
-    if (typeof wrapped['value'] === 'string') return wrapped['value'];
-  }
-
-  return null;
 }
 
 // ---------------------------------------------------------------------------

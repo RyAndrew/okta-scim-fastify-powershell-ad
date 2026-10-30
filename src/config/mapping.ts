@@ -6,6 +6,8 @@
 // attribute mappings — no route code needs to change.
 // ---------------------------------------------------------------------------
 
+import { ScimUser, SCIM_SCHEMA_USER } from 'scim-fastify-core';
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -105,40 +107,56 @@ export function scimToAdParams(
 }
 
 // ---------------------------------------------------------------------------
-// AD → SCIM partial mapping (for enriching the cached resource after a sync)
+// AD → SCIM mapping
 // ---------------------------------------------------------------------------
 
 /**
- * Merges an AD user object (from `Get-ADUser -Properties *`) into an existing
- * SCIM resource, updating the fields we manage.
+ * A user as returned by `execFindAdUsers` — the Get-ADUser properties we
+ * project, with GUIDs and dates already converted to strings.
  */
-export function mergeAdIntoScim(
-  existing: Record<string, unknown>,
-  adUser: Record<string, unknown>,
-): Record<string, unknown> {
-  const merged = { ...existing };
+export interface AdUser {
+  ObjectGUID: string;
+  SamAccountName: string;
+  UserPrincipalName: string | null;
+  GivenName: string | null;
+  Surname: string | null;
+  DisplayName: string | null;
+  EmailAddress: string | null;
+  EmployeeID: string | null;
+  Enabled: boolean;
+  DistinguishedName: string;
+  whenCreated: string | null;
+  whenChanged: string | null;
+}
 
-  if (adUser['SamAccountName']) {
-    merged['userName'] = adUser['SamAccountName'];
-  }
-  if (adUser['DisplayName']) {
-    merged['displayName'] = adUser['DisplayName'];
-  }
-  if (adUser['GivenName'] || adUser['Surname']) {
-    merged['name'] = {
-      ...(merged['name'] as Record<string, unknown> | undefined ?? {}),
-      ...(adUser['GivenName'] ? { givenName: adUser['GivenName'] } : {}),
-      ...(adUser['Surname'] ? { familyName: adUser['Surname'] } : {}),
-    };
-  }
-  if (adUser['EmailAddress']) {
-    merged['emails'] = [
-      { value: adUser['EmailAddress'], type: 'work', primary: true },
-    ];
-  }
-  if (typeof adUser['Enabled'] === 'boolean') {
-    merged['active'] = adUser['Enabled'];
-  }
+/**
+ * Converts an AD user into a SCIM User resource. The SCIM id is the
+ * AD objectGUID; userName is the UPN when set, else the SamAccountName.
+ */
+export function adToScimUser(adUser: AdUser): ScimUser {
+  const name =
+    adUser.GivenName || adUser.Surname
+      ? {
+          ...(adUser.GivenName ? { givenName: adUser.GivenName } : {}),
+          ...(adUser.Surname ? { familyName: adUser.Surname } : {}),
+        }
+      : undefined;
 
-  return merged;
+  return {
+    schemas: [SCIM_SCHEMA_USER],
+    id: adUser.ObjectGUID,
+    externalId: adUser.EmployeeID ?? undefined,
+    userName: adUser.UserPrincipalName ?? adUser.SamAccountName,
+    name,
+    displayName: adUser.DisplayName ?? undefined,
+    emails: adUser.EmailAddress
+      ? [{ value: adUser.EmailAddress, type: 'work', primary: true }]
+      : undefined,
+    active: adUser.Enabled,
+    meta: {
+      resourceType: 'User',
+      created: adUser.whenCreated ?? undefined,
+      lastModified: adUser.whenChanged ?? undefined,
+    },
+  };
 }

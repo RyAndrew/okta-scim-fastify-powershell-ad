@@ -50,20 +50,4 @@ export async function initDb(): Promise<void> {
       t.timestamp('created_at').defaultTo(db.fn.now());
     });
   }
-
-  // --- scim_users ----------------------------------------------------------
-  // Local cache — the source of truth for sync state.
-  if (!(await db.schema.hasTable('scim_users'))) {
-    await db.schema.createTable('scim_users', (t) => {
-      t.string('id').primary();
-      t.text('ad_object_guid').nullable();
-      t.text('sam_account_name').unique().nullable();
-      t.text('scim_resource').notNullable();          // full SCIM JSON (IdP view)
-      t.text('ad_resource').nullable();               // full AD JSON (Get-ADUser -Properties *)
-      t.string('sync_status').notNullable().defaultTo('pending'); // synced | pending | error
-      t.text('last_error').nullable();
-      t.timestamp('created_at').defaultTo(db.fn.now());
-      t.timestamp('updated_at').defaultTo(db.fn.now());
-    });
-  }
 }
